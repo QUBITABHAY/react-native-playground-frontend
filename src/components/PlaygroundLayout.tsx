@@ -32,6 +32,18 @@ export default function PlaygroundLayout() {
   const [isBuilding, setIsBuilding] = useState(false);
   const [buildError, setBuildError] = useState<string | null>(null);
   const [projectId, setProjectId] = useState<string | null>(null);
+  
+  // Project management state
+  interface ProjectMeta {
+    id: string;
+    name: string;
+    createdAt: string;
+    updatedAt: string;
+  }
+  const [showProjects, setShowProjects] = useState(false);
+  const [projectList, setProjectList] = useState<ProjectMeta[]>([]);
+  const [loadingProjects, setLoadingProjects] = useState(false);
+  const [saveError, setSaveError] = useState<string | null>(null);
 
   const findFirstFile = (nodes: FileNode[]): FileNode | null => {
     for (const n of nodes) {
@@ -42,6 +54,25 @@ export default function PlaygroundLayout() {
       }
     }
     return null;
+  };
+
+  const sanitizeFileTree = (nodes: FileNode[]): FileNode[] => {
+    return nodes.map(node => {
+      const sanitized: FileNode = {
+        id: node.id,
+        name: node.name,
+        type: node.type,
+        path: node.path
+      };
+      
+      if (node.type === 'file') {
+        sanitized.content = node.content ?? '';
+      } else {
+        sanitized.children = node.children ? sanitizeFileTree(node.children) : [];
+      }
+      
+      return sanitized;
+    });
   };
 
   // Initialize: load project from isolated backend or create one from template
@@ -94,20 +125,56 @@ export default function PlaygroundLayout() {
     if (!files || files.length === 0) return;
     const t = setTimeout(async () => {
       try {
+        setSaveError(null);
+        
+        const sanitizedFiles = sanitizeFileTree(files);
+        const payload = { files: sanitizedFiles };
+        console.log('📦 Payload sample:', JSON.stringify(payload).substring(0, 200) + '...');
+        
         const res = await fetch(`${backendBase}/api/projects/${projectId}/files`, {
           method: 'PUT',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ files })
+          body: JSON.stringify(payload)
         });
+        
         if (res.ok) {
           setLastSaved(new Date());
+          setSaveError(null);
+          console.log('✅ Saved successfully at', new Date().toLocaleTimeString());
+        } else {
+          const errorData = await res.json().catch(() => ({ error: 'Unknown error' }));
+          const errorMsg = errorData.error || `HTTP ${res.status}`;
+          setSaveError(errorMsg);
         }
-      } catch (e) {
-        console.warn('Save skipped (backend not available)', e);
+      } catch (e: any) {
+        setSaveError(e.message || 'Network error');
+        console.warn(e);
       }
     }, 1200);
     return () => clearTimeout(t);
   }, [files, projectId]);
+
+  useEffect(() => {
+    if (!currentFile) return;
+    
+    const findFileByPath = (nodes: FileNode[], targetPath: string): FileNode | null => {
+      for (const node of nodes) {
+        if (node.path === targetPath && node.type === 'file') {
+          return node;
+        }
+        if (node.children) {
+          const found = findFileByPath(node.children, targetPath);
+          if (found) return found;
+        }
+      }
+      return null;
+    };
+    
+    const latestFile = findFileByPath(files, currentFile.path);
+    if (latestFile && latestFile.content !== currentFile.content) {
+      setCurrentFile(latestFile);
+    }
+  }, [files, currentFile?.path]);
 
   // Auto-save current file
   useEffect(() => {
@@ -177,7 +244,22 @@ export default function PlaygroundLayout() {
   // File management handlers
   const handleFileSelect = (file: FileNode) => {
     if (file.type === 'file') {
-      setCurrentFile(file);
+      // Find the file in the current files state to get the latest content
+      const findFileByPath = (nodes: FileNode[], targetPath: string): FileNode | null => {
+        for (const node of nodes) {
+          if (node.path === targetPath && node.type === 'file') {
+            return node;
+          }
+          if (node.children) {
+            const found = findFileByPath(node.children, targetPath);
+            if (found) return found;
+          }
+        }
+        return null;
+      };
+      
+      const latestFile = findFileByPath(files, file.path);
+      setCurrentFile(latestFile || file);
     }
   };
 
@@ -267,6 +349,61 @@ export default function PlaygroundLayout() {
     const template = templateName === 'crud' ? generateReactNativeTemplate() : emptyProject();
     setFiles(template);
     setCurrentFile(template[0]);
+  };
+
+  // Fetch all projects from database
+  const fetchProjectList = async () => {
+    setLoadingProjects(true);
+    try {
+      const res = await fetch(`${backendBase}/api/projects`);
+      if (res.ok) {
+        const data = await res.json();
+        setProjectList(data);
+      }
+    } catch (e) {
+      console.error('Failed to fetch projects', e);
+    } finally {
+      setLoadingProjects(false);
+    }
+  };
+
+  const loadProject = async (id: string) => {
+    try {
+      const res = await fetch(`${backendBase}/api/projects/${id}`);
+      if (res.ok) {
+        const data = await res.json();
+        setProjectId(data.id);
+        setFiles(data.files || []);
+        setCurrentFile(findFirstFile(data.files || []));
+        localStorage.setItem('rn-project-id', data.id);
+        setShowProjects(false);
+      } else {
+        console.error(res.status, res.statusText);
+      }
+    } catch (e) {
+      console.error(e);
+    }
+  };
+
+  const createNewProject = async () => {
+    try {
+      const template = generateReactNativeTemplate();
+      const createRes = await fetch(`${backendBase}/api/projects`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ name: `Project ${new Date().toLocaleDateString()}`, files: template })
+      });
+      if (createRes.ok) {
+        const created = await createRes.json();
+        setProjectId(created.id);
+        setFiles(template);
+        setCurrentFile(findFirstFile(template));
+        localStorage.setItem('rn-project-id', created.id);
+        setShowProjects(false);
+      }
+    } catch (e) {
+      console.error('Failed to create project', e);
+    }
   };
 
   const bundleAndPreview = async () => {
@@ -365,14 +502,36 @@ export default function PlaygroundLayout() {
             <span className="text-yellow-500">⚡</span>
             <span className="font-semibold">15,703</span>
           </div>
+          <button
+            onClick={() => {
+              setShowProjects(true);
+              fetchProjectList();
+            }}
+            className="px-3 py-1.5 rounded text-sm hover:opacity-80 transition-opacity"
+            style={{ backgroundColor: themeColors.bg, color: themeColors.text }}
+          >
+            Projects
+          </button>
+          <button
+            onClick={createNewProject}
+            className="px-3 py-1.5 rounded text-sm hover:opacity-80 transition-opacity"
+            style={{ backgroundColor: themeColors.bg, color: themeColors.text }}
+          >
+            New
+          </button>
           {projectId && (
             <div className="text-xs px-2 py-1 rounded" style={{ backgroundColor: themeColors.bg, color: themeColors.textSecondary }}>
               Project: {projectId.slice(0, 6)}…
             </div>
           )}
-          {currentSettings.autoSave && lastSaved && (
+          {saveError && (
+            <div className="text-xs px-2 py-1 rounded bg-red-600 text-white" title={saveError}>
+              ⚠️ Save Error
+            </div>
+          )}
+          {!saveError && currentSettings.autoSave && lastSaved && (
             <div className="text-xs" style={{ color: themeColors.textSecondary }}>
-              Saved {lastSaved.toLocaleTimeString()}
+              ✓ Saved {lastSaved.toLocaleTimeString()}
             </div>
           )}
 
@@ -598,6 +757,82 @@ export default function PlaygroundLayout() {
         initialSettings={currentSettings}
         onSave={handleSaveSettings}
       />
+      
+      {/* Projects Modal */}
+      {showProjects && (
+        <div
+          className="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50"
+          onClick={() => setShowProjects(false)}
+        >
+          <div
+            className="rounded-lg shadow-xl p-6 max-w-2xl w-full max-h-[80vh] overflow-auto"
+            style={{ backgroundColor: themeColors.bgSecondary }}
+            onClick={(e) => e.stopPropagation()}
+          >
+            <div className="flex items-center justify-between mb-4">
+              <h2 className="text-xl font-bold" style={{ color: themeColors.text }}>
+                Your Projects
+              </h2>
+              <button
+                onClick={() => setShowProjects(false)}
+                className="text-2xl hover:opacity-70"
+                style={{ color: themeColors.textSecondary }}
+              >
+                ×
+              </button>
+            </div>
+            
+            {loadingProjects ? (
+              <div className="text-center py-8" style={{ color: themeColors.textSecondary }}>
+                Loading projects...
+              </div>
+            ) : projectList.length === 0 ? (
+              <div className="text-center py-8" style={{ color: themeColors.textSecondary }}>
+                <p className="mb-4">No projects found</p>
+                <button
+                  onClick={createNewProject}
+                  className="px-4 py-2 rounded bg-blue-600 text-white hover:bg-blue-700"
+                >
+                  Create First Project
+                </button>
+              </div>
+            ) : (
+              <div className="space-y-2">
+                {projectList.map((proj) => (
+                  <div
+                    key={proj.id}
+                    onClick={() => loadProject(proj.id)}
+                    className="p-4 rounded cursor-pointer hover:opacity-80 transition-opacity"
+                    style={{
+                      backgroundColor: themeColors.bg,
+                      border: `2px solid ${proj.id === projectId ? '#3b82f6' : themeColors.border}`
+                    }}
+                  >
+                    <div className="flex items-center justify-between">
+                      <div>
+                        <h3 className="font-medium" style={{ color: themeColors.text }}>
+                          {proj.name}
+                        </h3>
+                        <p className="text-xs mt-1" style={{ color: themeColors.textSecondary }}>
+                          Created: {new Date(proj.createdAt).toLocaleDateString()}
+                        </p>
+                        <p className="text-xs" style={{ color: themeColors.textSecondary }}>
+                          Updated: {new Date(proj.updatedAt).toLocaleString()}
+                        </p>
+                      </div>
+                      {proj.id === projectId && (
+                        <span className="text-xs px-2 py-1 rounded bg-blue-600 text-white">
+                          Current
+                        </span>
+                      )}
+                    </div>
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
+        </div>
+      )}
     </div>
   );
 }
